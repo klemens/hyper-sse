@@ -1,3 +1,5 @@
+#[macro_use]
+extern crate failure;
 extern crate futures;
 extern crate hyper;
 #[macro_use]
@@ -6,6 +8,7 @@ extern crate serde;
 extern crate serde_json;
 extern crate tokio;
 
+use failure::Error;
 use futures::future;
 use hyper::rt::{Future, Stream};
 use hyper::service::service_fn;
@@ -31,7 +34,7 @@ impl Server {
         }
     }
 
-    pub fn push<S: Serialize>(&self, event: &str, message: &S) -> Result<(), serde_json::error::Error> {
+    pub fn push<S: Serialize>(&self, event: &str, message: &S) -> Result<(), Error> {
         let payload = serde_json::to_string(message)?;
         let message = format!("event: {}\ndata: {}\n\n", event, payload);
 
