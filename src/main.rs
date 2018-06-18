@@ -2,18 +2,80 @@ extern crate futures;
 extern crate hyper;
 #[macro_use]
 extern crate lazy_static;
+extern crate serde;
+extern crate serde_json;
 extern crate tokio;
 
 use futures::future;
 use hyper::rt::{Future, Stream};
 use hyper::service::service_fn;
-use hyper::{Body, Chunk, Request, Response, Server, StatusCode};
+use hyper::{Body, Chunk, Request, Response, StatusCode};
+use serde::Serialize;
 use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::timer::Interval;
+
+struct Server {
+    clients: Mutex<Vec<Client>>,
+    next_id: AtomicUsize,
+}
+
+impl Server {
+    pub fn new() -> Server {
+        Server {
+            clients: Mutex::new(vec![]),
+            next_id: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn push<S: Serialize>(&self, event: &str, message: &S) -> Result<(), serde_json::error::Error> {
+        let payload = serde_json::to_string(message)?;
+        let message = format!("event: {}\ndata: {}\n\n", event, payload);
+
+        self.send_chunk_to_all_clients(message);
+
+        Ok(())
+    }
+
+    pub fn send_heartbeats(&self) {
+        self.send_chunk_to_all_clients(":\n\n".into());
+    }
+
+    pub fn add_client(&self, sender: hyper::body::Sender) {
+        self.clients
+            .lock().unwrap()
+            .push(Client {
+                tx: sender,
+                id: self.next_id.fetch_add(1, Ordering::SeqCst),
+                first_error: None,
+            });
+    }
+
+    pub fn remove_stale_clients(&self) {
+        let mut clients = self.clients.lock().unwrap();
+
+        clients.retain(|client| {
+            if let Some(first_error) = client.first_error {
+                if first_error.elapsed() > Duration::from_secs(5) {
+                    println!("Removing stale client {}", client.id);
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
+    fn send_chunk_to_all_clients(&self, chunk: String) {
+        let mut clients = self.clients.lock().unwrap();
+        for client in clients.iter_mut() {
+            let result = client.send_chunk(Chunk::from(chunk.clone()));
+            println!("  {}: {:?}", client.id, result.is_ok());
+        }
+    }
+}
 
 struct Client {
     tx: hyper::body::Sender,
@@ -41,10 +103,8 @@ impl Client {
     }
 }
 
-static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
-
 lazy_static! {
-    static ref CLIENTS: Mutex<Vec<Client>> = Mutex::new(vec![]);
+    static ref PUSH_SERVER: Server = Server::new();
 }
 
 fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
@@ -64,7 +124,7 @@ fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
                                 var newElement = document.createElement('li');
                                 var eventList = document.querySelector('ol');
 
-                                newElement.innerHTML = event.data;
+                                newElement.innerHTML = JSON.parse(event.data);
                                 eventList.appendChild(newElement);
                             });
                         </script>
@@ -74,20 +134,13 @@ fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
         "/events" => {
             let (sender, body) = Body::channel();
 
-            CLIENTS
-                .lock()
-                .expect("RwLock poisoned")
-                .push(Client {
-                    tx: sender,
-                    id: CLIENT_ID.fetch_add(1, Ordering::SeqCst),
-                    first_error: None,
-                });
+            PUSH_SERVER.add_client(sender);
 
             Response::builder()
                 .header("Cache-Control", "no-cache")
                 .header("Content-Type", "text/event-stream")
                 .body(body)
-                .expect("Invalid header specification")
+                .expect("Invalid SSE header specification")
         },
         _ => {
             Response::builder()
@@ -111,58 +164,23 @@ fn terminal() {
 
         println!("Sending '{}' to every listener:", line);
 
-        let mut clients = CLIENTS.lock().unwrap();
-        for client in clients.iter_mut() {
-            let chunk = format!("event: update\ndata: {}\n\n", line);
-            let result = client.send_chunk(Chunk::from(chunk));
-            println!("  {}: {:?}", client.id, result.is_ok());
-        }
+        PUSH_SERVER.push("update", &line).unwrap();
     }
-}
-
-fn remove_stale_clients(_: Instant) -> impl Future<Item = (), Error = tokio::timer::Error> {
-    let mut clients = CLIENTS.lock().unwrap();
-
-    clients.retain(|client| {
-        if let Some(first_error) = client.first_error {
-            if first_error.elapsed() > Duration::from_secs(5) {
-                println!("Removing stale client {}", client.id);
-                return false;
-            }
-        }
-
-        true
-    });
-
-    future::ok(())
-}
-
-fn send_heartbeats(_instant: Instant) -> impl Future<Item = (), Error = tokio::timer::Error> {
-    let mut clients = CLIENTS.lock().unwrap();
-
-    for client in clients.iter_mut() {
-        println!("Sending heartbeat to client {}", client.id);
-
-        let chunk = Chunk::from(": heatbeat\n\n");
-        client.send_chunk(chunk).ok();
-    }
-
-    future::ok(())
 }
 
 fn main() {
     let addr = ([0, 0, 0, 0], 3000).into();
 
-    let server = Server::bind(&addr)
+    let server = hyper::Server::bind(&addr)
         .serve(|| service_fn(sse))
         .map_err(|e| eprintln!("server error: {}", e));
 
-    let heartbeat = Interval::new(Instant::now(), Duration::from_secs(5))
-        .for_each(send_heartbeats)
-        .map_err(|e| eprintln!("timer error: {}", e));
-
-    let cleanup = Interval::new(Instant::now(), Duration::from_secs(5))
-        .for_each(remove_stale_clients)
+    let push_maintenance = Interval::new(Instant::now(), Duration::from_secs(5))
+        .for_each(|_| {
+            PUSH_SERVER.remove_stale_clients();
+            PUSH_SERVER.send_heartbeats();
+            future::ok(())
+        })
         .map_err(|e| eprintln!("timer error: {}", e));
 
     thread::spawn(terminal);
@@ -170,7 +188,7 @@ fn main() {
     println!("Listening on http://{}", addr);
     hyper::rt::run(
         server
-        .join3(cleanup, heartbeat)
+        .join(push_maintenance)
         .map(|_| ())
     );
 }
