@@ -18,11 +18,26 @@ use tokio::timer::Interval;
 struct Client {
     tx: hyper::body::Sender,
     id: usize,
+    first_error: Option<Instant>,
 }
 
 impl Client {
     fn send_chunk(&mut self, chunk: Chunk) -> Result<(), Chunk> {
-        self.tx.send_data(chunk)
+        let result = self.tx.send_data(chunk);
+
+        match (&result, self.first_error) {
+            (Err(_), None) => {
+                // Store time when an error was first seen
+                self.first_error = Some(Instant::now());
+            }
+            (Ok(_), Some(_)) => {
+                // Clear error when write succeeds
+                self.first_error = None;
+            }
+            _ => {}
+        }
+
+        result
     }
 }
 
@@ -65,6 +80,7 @@ fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
                 .push(Client {
                     tx: sender,
                     id: CLIENT_ID.fetch_add(1, Ordering::SeqCst),
+                    first_error: None,
                 });
 
             Response::builder()
@@ -91,9 +107,6 @@ fn terminal() {
 
         if line.is_empty() {
             continue
-        } else if line == "drop" {
-            CLIENTS.write().unwrap().clear();
-            continue
         }
 
         println!("Sending '{}' to every listener:", line);
@@ -105,6 +118,23 @@ fn terminal() {
             println!("  {}: {:?}", client.id, result.is_ok());
         }
     }
+}
+
+fn remove_stale_clients(_: Instant) -> impl Future<Item = (), Error = tokio::timer::Error> {
+    let mut clients = CLIENTS.lock().unwrap();
+
+    clients.retain(|client| {
+        if let Some(first_error) = client.first_error {
+            if first_error.elapsed() > Duration::from_secs(5) {
+                println!("Removing stale client {}", client.id);
+                return false;
+            }
+        }
+
+        true
+    });
+
+    future::ok(())
 }
 
 fn send_heartbeats(_instant: Instant) -> impl Future<Item = (), Error = tokio::timer::Error> {
@@ -131,12 +161,16 @@ fn main() {
         .for_each(send_heartbeats)
         .map_err(|e| eprintln!("timer error: {}", e));
 
+    let cleanup = Interval::new(Instant::now(), Duration::from_secs(5))
+        .for_each(remove_stale_clients)
+        .map_err(|e| eprintln!("timer error: {}", e));
+
     thread::spawn(terminal);
 
     println!("Listening on http://{}", addr);
     hyper::rt::run(
         server
-        .join(heartbeat)
+        .join3(cleanup, heartbeat)
         .map(|_| ())
     );
 }
