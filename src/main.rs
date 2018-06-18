@@ -2,18 +2,34 @@ extern crate futures;
 extern crate hyper;
 #[macro_use]
 extern crate lazy_static;
+extern crate tokio;
 
 use futures::future;
 use hyper::rt::{Future, Stream};
 use hyper::service::service_fn;
 use hyper::{Body, Chunk, Request, Response, Server, StatusCode};
 use std::io::{self, BufRead};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::timer::Interval;
+
+struct Client {
+    tx: hyper::body::Sender,
+    id: usize,
+}
+
+impl Client {
+    fn send_chunk(&mut self, chunk: Chunk) -> Result<(), Chunk> {
+        self.tx.send_data(chunk)
+    }
+}
+
+static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
-    static ref CLIENTS: RwLock<Vec<hyper::body::Sender>> = RwLock::new(vec![]);
+    static ref CLIENTS: Mutex<Vec<Client>> = Mutex::new(vec![]);
 }
 
 fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
@@ -44,9 +60,12 @@ fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
             let (sender, body) = Body::channel();
 
             CLIENTS
-                .write()
+                .lock()
                 .expect("RwLock poisoned")
-                .push(sender);
+                .push(Client {
+                    tx: sender,
+                    id: CLIENT_ID.fetch_add(1, Ordering::SeqCst),
+                });
 
             Response::builder()
                 .header("Cache-Control", "no-cache")
@@ -79,24 +98,26 @@ fn terminal() {
 
         println!("Sending '{}' to every listener:", line);
 
-        let mut clients = CLIENTS.write().unwrap();
-        for (i, client) in clients.iter_mut().enumerate() {
+        let mut clients = CLIENTS.lock().unwrap();
+        for client in clients.iter_mut() {
             let chunk = format!("event: update\ndata: {}\n\n", line);
-            let result = client.send_data(Chunk::from(chunk));
-            println!("  {}: {:?}", i, result);
+            let result = client.send_chunk(Chunk::from(chunk));
+            println!("  {}: {:?}", client.id, result.is_ok());
         }
     }
 }
 
-fn heartbeat() {
-    loop {
-        thread::sleep(Duration::from_secs(10));
-        let mut clients = CLIENTS.write().unwrap();
-        for client in clients.iter_mut() {
-            let chunk = format!(": heatbeat\n\n");
-            client.send_data(Chunk::from(chunk)).ok();
-        }
+fn send_heartbeats(_instant: Instant) -> impl Future<Item = (), Error = tokio::timer::Error> {
+    let mut clients = CLIENTS.lock().unwrap();
+
+    for client in clients.iter_mut() {
+        println!("Sending heartbeat to client {}", client.id);
+
+        let chunk = Chunk::from(": heatbeat\n\n");
+        client.send_chunk(chunk).ok();
     }
+
+    future::ok(())
 }
 
 fn main() {
@@ -106,9 +127,16 @@ fn main() {
         .serve(|| service_fn(sse))
         .map_err(|e| eprintln!("server error: {}", e));
 
+    let heartbeat = Interval::new(Instant::now(), Duration::from_secs(5))
+        .for_each(send_heartbeats)
+        .map_err(|e| eprintln!("timer error: {}", e));
+
     thread::spawn(terminal);
-    thread::spawn(heartbeat);
 
     println!("Listening on http://{}", addr);
-    hyper::rt::run(server);
+    hyper::rt::run(
+        server
+        .join(heartbeat)
+        .map(|_| ())
+    );
 }
