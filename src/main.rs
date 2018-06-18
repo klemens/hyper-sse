@@ -14,6 +14,7 @@ use hyper::rt::{Future, Stream};
 use hyper::service::service_fn;
 use hyper::{Body, Chunk, Request, Response, StatusCode};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -21,24 +22,27 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::timer::Interval;
 
+type Clients = Vec<Client>;
+type Channels = HashMap<u64, Clients>;
+
 struct Server {
-    clients: Mutex<Vec<Client>>,
+    channels: Mutex<Channels>,
     next_id: AtomicUsize,
 }
 
 impl Server {
     pub fn new() -> Server {
         Server {
-            clients: Mutex::new(vec![]),
+            channels: Mutex::new(HashMap::new()),
             next_id: AtomicUsize::new(0),
         }
     }
 
-    pub fn push<S: Serialize>(&self, event: &str, message: &S) -> Result<(), Error> {
+    pub fn push<S: Serialize>(&self, channel: u64, event: &str, message: &S) -> Result<(), Error> {
         let payload = serde_json::to_string(message)?;
         let message = format!("event: {}\ndata: {}\n\n", event, payload);
 
-        self.send_chunk_to_all_clients(message);
+        self.send_chunk_to_channel(message, channel)?;
 
         Ok(())
     }
@@ -47,9 +51,11 @@ impl Server {
         self.send_chunk_to_all_clients(":\n\n".into());
     }
 
-    pub fn add_client(&self, sender: hyper::body::Sender) {
-        self.clients
+    pub fn add_client(&self, channel: u64, sender: hyper::body::Sender) {
+        self.channels
             .lock().unwrap()
+            .entry(channel)
+            .or_insert_with(Default::default)
             .push(Client {
                 tx: sender,
                 id: self.next_id.fetch_add(1, Ordering::SeqCst),
@@ -58,28 +64,53 @@ impl Server {
     }
 
     pub fn remove_stale_clients(&self) {
-        let mut clients = self.clients.lock().unwrap();
+        let mut channels = self.channels.lock().unwrap();
 
-        clients.retain(|client| {
-            if let Some(first_error) = client.first_error {
-                if first_error.elapsed() > Duration::from_secs(5) {
-                    println!("Removing stale client {}", client.id);
-                    return false;
+        channels.retain(|_, clients| {
+            clients.retain(|client| {
+                if let Some(first_error) = client.first_error {
+                    if first_error.elapsed() > Duration::from_secs(5) {
+                        println!("Removing stale client {}", client.id);
+                        return false;
+                    }
                 }
-            }
-            true
+                true
+            });
+
+            !clients.is_empty()
         });
     }
 
+    fn send_chunk_to_channel(&self, chunk: String, channel: u64) -> Result<(), Error> {
+        let mut channels = self.channels.lock().unwrap();
+
+        match channels.get_mut(&channel) {
+            Some(clients) => {
+                for client in clients.iter_mut() {
+                    let chunk = Chunk::from(chunk.clone());
+                    let result = client.send_chunk(chunk);
+                    println!("  {}: {:?}", client.id, result.is_ok());
+                }
+            }
+            None => {
+                return Err(format_err!("Invalid channel: {}", channel));
+            }
+        }
+
+        Ok(())
+    }
+
     fn send_chunk_to_all_clients(&self, chunk: String) {
-        let mut clients = self.clients.lock().unwrap();
-        for client in clients.iter_mut() {
-            let result = client.send_chunk(Chunk::from(chunk.clone()));
-            println!("  {}: {:?}", client.id, result.is_ok());
+        let mut channels = self.channels.lock().unwrap();
+
+        for client in channels.values_mut().flat_map(IntoIterator::into_iter) {
+            let chunk = Chunk::from(chunk.clone());
+            client.send_chunk(chunk).ok();
         }
     }
 }
 
+#[derive(Debug)]
 struct Client {
     tx: hyper::body::Sender,
     id: usize,
@@ -137,7 +168,7 @@ fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
         "/events" => {
             let (sender, body) = Body::channel();
 
-            PUSH_SERVER.add_client(sender);
+            PUSH_SERVER.add_client(0, sender);
 
             Response::builder()
                 .header("Cache-Control", "no-cache")
@@ -167,7 +198,7 @@ fn terminal() {
 
         println!("Sending '{}' to every listener:", line);
 
-        PUSH_SERVER.push("update", &line).unwrap();
+        PUSH_SERVER.push(0, "update", &line).unwrap();
     }
 }
 
