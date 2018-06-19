@@ -16,6 +16,7 @@ use hyper::{Body, Chunk, Request, Response, StatusCode};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{self, BufRead};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -51,7 +52,36 @@ impl Server {
         self.send_chunk_to_all_clients(":\n\n".into());
     }
 
-    pub fn add_client(&self, channel: u64, sender: hyper::body::Sender) {
+    // Initiate a new sse stream for the given request.
+    //
+    // The request must include a valid authorization token cookie. The
+    // channel is parsed from the last segment of the uri path. If the
+    // request cannot be parsed correctly of the auth token is expired,
+    // an appropriate http error response is returned.
+    pub fn create_stream(&self, request: &Request<Body>) -> Response<Body> {
+        // Extract channel from uri path (last segment)
+        let path = request.uri().path();
+        let channel = match path.rsplit('/').next().map(FromStr::from_str) {
+            Some(Ok(channel)) => channel,
+            _ => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::empty())
+                    .expect("Could not create response");
+            }
+        };
+
+        let (sender, body) = Body::channel();
+        self.add_client(channel, sender);
+
+        Response::builder()
+            .header("Cache-Control", "no-cache")
+            .header("Content-Type", "text/event-stream")
+            .body(body)
+            .expect("Could not create response")
+    }
+
+    fn add_client(&self, channel: u64, sender: hyper::body::Sender) {
         self.channels
             .lock().unwrap()
             .entry(channel)
@@ -153,7 +183,7 @@ fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
                     <body>
                         <ol></ol>
                         <script>
-                            var evtSource = new EventSource('http://10.0.11.10:3000/events');
+                            var evtSource = new EventSource('http://10.0.11.10:3000/events/0');
                             evtSource.addEventListener('update', event => {
                                 var newElement = document.createElement('li');
                                 var eventList = document.querySelector('ol');
@@ -165,22 +195,8 @@ fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
                     </body>".into())
                 .expect("Invalid header specification")
         },
-        "/events" => {
-            let (sender, body) = Body::channel();
-
-            PUSH_SERVER.add_client(0, sender);
-
-            Response::builder()
-                .header("Cache-Control", "no-cache")
-                .header("Content-Type", "text/event-stream")
-                .body(body)
-                .expect("Invalid SSE header specification")
-        },
         _ => {
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body("Not found!".into())
-                .unwrap()
+            PUSH_SERVER.create_stream(&req)
         }
     };
 
@@ -198,7 +214,7 @@ fn terminal() {
 
         println!("Sending '{}' to every listener:", line);
 
-        PUSH_SERVER.push(0, "update", &line).unwrap();
+        PUSH_SERVER.push(0, "update", &line).ok();
     }
 }
 
