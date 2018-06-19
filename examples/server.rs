@@ -6,92 +6,91 @@ extern crate hyper;
 extern crate lazy_static;
 extern crate tokio;
 
-use futures::future;
-use hyper::rt::{Future, Stream};
-use hyper::service::service_fn;
 use hyper::{Body, Request, Response};
-use hyper_sse::*;
+use hyper_sse::Server;
 use std::io::{self, BufRead};
-use std::thread;
-use std::time::{Duration, Instant};
-use tokio::timer::Interval;
 
 lazy_static! {
-    static ref PUSH_SERVER: Server<u64> = Server::new();
+    static ref PUSH_SERVER: Server<u8> = Server::new();
 }
 
-fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
-    let response = match req.uri().path() {
+const HTML: &'static str = "\
+<html>
+<head>
+    <title>hyper_sse demo</title>
+    <meta charset=\"utf-8\" />
+</head>
+<body>
+    <ol></ol>
+    <script>
+        var evtSource = new EventSource('http://[::1]:3000/events/0');
+        evtSource.addEventListener('update', event => {
+            var newElement = document.createElement('li');
+            var eventList = document.querySelector('ol');
+
+            newElement.innerHTML = JSON.parse(event.data);
+            eventList.appendChild(newElement);
+        });
+    </script>
+</body>";
+
+fn service_handler(req: Request<Body>) -> Response<Body> {
+    match req.uri().path() {
         "/" => {
             let auth_cookie = PUSH_SERVER.generate_auth_cookie();
 
             Response::builder()
                 .header("Set-Cookie", auth_cookie.to_string().as_str())
-                .body("<html>
-                    <head>
-                        <title>EventSource Test</title>
-                        <meta charset=\"utf-8\" />
-                    </head>
-                    <body>
-                        <ol></ol>
-                        <script>
-                            var evtSource = new EventSource('http://10.0.11.10:3000/events/0');
-                            evtSource.addEventListener('update', event => {
-                                var newElement = document.createElement('li');
-                                var eventList = document.querySelector('ol');
-
-                                newElement.innerHTML = JSON.parse(event.data);
-                                eventList.appendChild(newElement);
-                            });
-                        </script>
-                    </body>".into())
+                .body(HTML.into())
                 .expect("Invalid header specification")
         },
         _ => {
             PUSH_SERVER.create_stream(&req)
         }
-    };
-
-    future::ok(response)
-}
-
-fn terminal() {
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line.expect("line decoding error");
-
-        if line.is_empty() {
-            continue
-        }
-
-        println!("Sending '{}' to every listener:", line);
-
-        PUSH_SERVER.push(0, "update", &line).ok();
     }
 }
 
+fn spawn_server(server: &'static Server<u8>) {
+    use futures::future;
+    use hyper::rt::{Future, Stream};
+    use hyper::service::service_fn_ok;
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use tokio::timer::Interval;
 
-fn main() {
-    let addr = ([0, 0, 0, 0], 3000).into();
+    let addr = ("[::1]:3000").parse().unwrap();
 
-    let server = hyper::Server::bind(&addr)
-        .serve(|| service_fn(sse))
-        .map_err(|e| eprintln!("server error: {}", e));
+    let http_server = hyper::Server::bind(&addr)
+        .serve(move || service_fn_ok(service_handler))
+        .map_err(|e| panic!("Push server failed: {}", e));
 
-    let push_maintenance = Interval::new(Instant::now(), Duration::from_secs(5))
-        .for_each(|_| {
-            PUSH_SERVER.remove_stale_clients();
-            PUSH_SERVER.send_heartbeats();
+    let maintenance = Interval::new(Instant::now(), Duration::from_secs(45))
+        .for_each(move |_| {
+            server.remove_stale_clients();
+            server.send_heartbeats();
             future::ok(())
         })
-        .map_err(|e| eprintln!("timer error: {}", e));
+        .map_err(|e| panic!("Push maintenance failed: {}", e));
 
-    thread::spawn(terminal);
+    thread::spawn(move || {
+        hyper::rt::run(
+            http_server
+            .join(maintenance)
+            .map(|_| ())
+        );
+    });
+}
 
-    println!("Listening on http://{}", addr);
-    hyper::rt::run(
-        server
-        .join(push_maintenance)
-        .map(|_| ())
-    );
+fn main() {
+    spawn_server(&PUSH_SERVER);
+
+    println!("Open to following page in your browser: http://[::1]:3000/");
+    println!("Enter push message and press enter:");
+
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line.unwrap();
+
+        PUSH_SERVER.push(0, "update", &line).ok();
+    }
 }
