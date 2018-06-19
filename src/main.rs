@@ -199,9 +199,7 @@ impl<C: Hash + Eq + FromStr> Server<C> {
                     println!("  {}: {:?}", client.id, result.is_ok());
                 }
             }
-            None => {
-                return Err(format_err!("Invalid channel: {}", channel));
-            }
+            None => {} // Currently no clients on the given channel
         }
 
         Ok(())
