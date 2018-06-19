@@ -178,7 +178,6 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
             clients.retain(|client| {
                 if let Some(first_error) = client.first_error {
                     if first_error.elapsed() > Duration::from_secs(5) {
-                        println!("Removing stale client {}", client.id);
                         return false;
                     }
                 }
@@ -244,8 +243,7 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
             Some(clients) => {
                 for client in clients.iter_mut() {
                     let chunk = Chunk::from(chunk.clone());
-                    let result = client.send_chunk(chunk);
-                    println!("  {}: {:?}", client.id, result.is_ok());
+                    client.send_chunk(chunk).ok();
                 }
             }
             None => {} // Currently no clients on the given channel
