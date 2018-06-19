@@ -9,7 +9,7 @@ extern crate tokio;
 use futures::future;
 use hyper::rt::{Future, Stream};
 use hyper::service::service_fn;
-use hyper::{Body,  Request, Response};
+use hyper::{Body, Request, Response};
 use hyper_sse::*;
 use std::io::{self, BufRead};
 use std::thread;

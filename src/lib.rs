@@ -2,28 +2,35 @@
 
 extern crate cookie;
 extern crate failure;
+extern crate futures;
 extern crate hyper;
 extern crate serde;
 extern crate serde_json;
+extern crate tokio;
 
 use cookie::{Cookie, CookieJar, Key};
 use failure::Error;
+use futures::future;
 use hyper::header::COOKIE;
 use hyper::{Body, Chunk, Request, Response, StatusCode};
+use hyper::rt::{Future, Stream};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::timer::Interval;
 
 const COOKIE_NAME: &'static str = "sse-authorization";
 
 type Clients = Vec<Client>;
 type Channels<C> = HashMap<C, Clients>;
 
-/// Push server implementing Server-Sent Events (SSE)
+/// Push server implementing Server-Sent Events (SSE).
 ///
 /// Because the Server implements `Sync`, it can be stored in
 /// a static variable using e.g. `lazy_static`.
@@ -33,7 +40,7 @@ pub struct Server<C> {
     cookie_key: Key,
 }
 
-impl<C: Hash + Eq + FromStr> Server<C> {
+impl<C: Hash + Eq + FromStr + Send> Server<C> {
     /// Create a new SSE push-server.
     pub fn new() -> Server<C> {
         Server {
@@ -62,7 +69,7 @@ impl<C: Hash + Eq + FromStr> Server<C> {
     ///
     /// The request must include a valid authorization token cookie. The
     /// channel is parsed from the last segment of the uri path. If the
-    /// request cannot be parsed correctly of the auth token is expired,
+    /// request cannot be parsed correctly or the auth token is expired,
     /// an appropriate http error response is returned.
     pub fn create_stream(&self, request: &Request<Body>) -> Response<Body> {
         // Extract channel from uri path (last segment)
@@ -180,6 +187,42 @@ impl<C: Hash + Eq + FromStr> Server<C> {
 
             !clients.is_empty()
         });
+    }
+
+    /// Run a push SSE server on the given address.
+    ///
+    /// Convenience function for starting a push server on a new thread.
+    /// Maintenance is done automatically, so you don't have to call
+    /// `send_heartbeats` or `remove_stale_clients`.
+    ///
+    /// This function will panic in the current thread if it cannot
+    /// listen on the specified address.
+    pub fn spawn(&'static self, listen: SocketAddr) -> JoinHandle<()> {
+        use hyper::service::service_fn_ok;
+
+        let sse_handler = move |req: Request<Body>| {
+            self.create_stream(&req)
+        };
+
+        let http_server = hyper::Server::bind(&listen)
+            .serve(move || service_fn_ok(sse_handler))
+            .map_err(|e| panic!("Push server failed: {}", e));
+
+        let maintenance = Interval::new(Instant::now(), Duration::from_secs(45))
+            .for_each(move |_| {
+                self.remove_stale_clients();
+                self.send_heartbeats();
+                future::ok(())
+            })
+            .map_err(|e| panic!("Push maintenance failed: {}", e));
+
+        thread::spawn(move || {
+            hyper::rt::run(
+                http_server
+                .join(maintenance)
+                .map(|_| ())
+            );
+        })
     }
 
     fn add_client(&self, channel: C, sender: hyper::body::Sender) {
