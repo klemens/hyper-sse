@@ -83,6 +83,7 @@ impl<C: Hash + Eq + FromStr> Server<C> {
             .get_all(COOKIE).iter()
             .filter_map(|cookies| cookies.to_str().ok())
             .flat_map(|cookies| cookies.split(';'))
+            .map(|cookie| cookie.trim())
             .filter(|cookie| cookie.starts_with(COOKIE_NAME))
             .map(|cookies| cookies.to_string()) // Cookies requires 'static
             .filter_map(|cookie| Cookie::parse(cookie).ok())
