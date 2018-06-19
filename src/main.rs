@@ -1,3 +1,6 @@
+#![feature(assoc_unix_epoch)]
+
+extern crate cookie;
 #[macro_use]
 extern crate failure;
 extern crate futures;
@@ -8,8 +11,10 @@ extern crate serde;
 extern crate serde_json;
 extern crate tokio;
 
+use cookie::{Cookie, CookieJar, Key};
 use failure::Error;
 use futures::future;
+use hyper::header::COOKIE;
 use hyper::rt::{Future, Stream};
 use hyper::service::service_fn;
 use hyper::{Body, Chunk, Request, Response, StatusCode};
@@ -20,8 +25,10 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::timer::Interval;
+
+const COOKIE_NAME: &'static str = "sse-authorization";
 
 type Clients = Vec<Client>;
 type Channels = HashMap<u64, Clients>;
@@ -29,6 +36,7 @@ type Channels = HashMap<u64, Clients>;
 struct Server {
     channels: Mutex<Channels>,
     next_id: AtomicUsize,
+    cookie_key: Key,
 }
 
 impl Server {
@@ -36,6 +44,7 @@ impl Server {
         Server {
             channels: Mutex::new(HashMap::new()),
             next_id: AtomicUsize::new(0),
+            cookie_key: Key::generate(),
         }
     }
 
@@ -71,6 +80,42 @@ impl Server {
             }
         };
 
+        // Parse request cookies and load into a cookie jar, which is
+        // used for the decrytion of the cookie
+        let mut cookies = request.headers()
+            .get_all(COOKIE).iter()
+            .filter_map(|cookies| cookies.to_str().ok())
+            .flat_map(|cookies| cookies.split(';'))
+            .filter(|cookie| cookie.starts_with(COOKIE_NAME))
+            .map(|cookies| cookies.to_string()) // Cookies requires 'static
+            .filter_map(|cookie| Cookie::parse(cookie).ok())
+            .fold(CookieJar::new(), |mut jar, cookie| {
+                jar.add_original(cookie);
+                jar
+            });
+
+        // Decrypt auth token, parse the unix timestamp, and calculate
+        // the elapsed time since its creation
+        let token_time = cookies.private(&self.cookie_key)
+            .get(COOKIE_NAME)
+            .and_then(|cookie| cookie.value().parse().ok())
+            .map(|value| SystemTime::UNIX_EPOCH + Duration::from_secs(value))
+            .map(|token_time| SystemTime::now().duration_since(token_time));
+
+        // Check if client is authorized (has a valid auth token
+        // not older than 24 hours)
+        let authorized = match token_time {
+            Some(Ok(duration)) => duration.as_secs() < 24 * 60 * 60,
+            Some(Err(_)) => true, // Token is in the future (time shift)
+            None => false, // No auth cookie found
+        };
+        if !authorized {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::empty())
+                .expect("Could not create response");
+        }
+
         let (sender, body) = Body::channel();
         self.add_client(channel, sender);
 
@@ -79,6 +124,30 @@ impl Server {
             .header("Content-Type", "text/event-stream")
             .body(body)
             .expect("Could not create response")
+    }
+
+    // Create a cookie with an authorization token that will be checked
+    // in `register_client` before establishing the sse stream.
+    //
+    // A new token can be send to the client on every request, as
+    // creating and checking the tokens is cheap. The token is valid
+    // for 24 hours after it has been generated.
+    pub fn generate_auth_cookie(&self) -> Cookie {
+        let unix_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("System time before unix epoch");
+        let cookie_value = unix_time.as_secs().to_string();
+
+        // Create private (encrypted and authenticated) cookie
+        // with the current unix timestamp as its value using
+        // the CookieJar
+        let mut jar = CookieJar::new();
+        jar.private(&self.cookie_key)
+            .add(Cookie::new(COOKIE_NAME, cookie_value));
+
+        jar.get(COOKIE_NAME)
+            .expect("Cookie was just inserted")
+            .clone() // TODO: can this clone be avoided?
     }
 
     fn add_client(&self, channel: u64, sender: hyper::body::Sender) {
@@ -174,7 +243,10 @@ lazy_static! {
 fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
     let response = match req.uri().path() {
         "/" => {
+            let auth_cookie = PUSH_SERVER.generate_auth_cookie();
+
             Response::builder()
+                .header("Set-Cookie", auth_cookie.to_string().as_str())
                 .body("<html>
                     <head>
                         <title>EventSource Test</title>

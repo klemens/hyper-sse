@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Klemens Schölhorn <klemens@schoelhorn.eu>"]
 
 [dependencies]
+cookie = { version = "0.9.1", features = ["secure"] }
 failure = "0.1"
 futures = "0.1"
 hyper = "0.12"
