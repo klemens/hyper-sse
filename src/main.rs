@@ -20,6 +20,7 @@ use hyper::service::service_fn;
 use hyper::{Body, Chunk, Request, Response, StatusCode};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io::{self, BufRead};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,16 +32,17 @@ use tokio::timer::Interval;
 const COOKIE_NAME: &'static str = "sse-authorization";
 
 type Clients = Vec<Client>;
-type Channels = HashMap<u64, Clients>;
+type Channels<C> = HashMap<C, Clients>;
 
-struct Server {
-    channels: Mutex<Channels>,
+struct Server<C> {
+    channels: Mutex<Channels<C>>,
     next_id: AtomicUsize,
     cookie_key: Key,
 }
 
-impl Server {
-    pub fn new() -> Server {
+impl<C: Hash + Eq + FromStr> Server<C> {
+    // Create a new SSE push-server
+    pub fn new() -> Server<C> {
         Server {
             channels: Mutex::new(HashMap::new()),
             next_id: AtomicUsize::new(0),
@@ -48,7 +50,13 @@ impl Server {
         }
     }
 
-    pub fn push<S: Serialize>(&self, channel: u64, event: &str, message: &S) -> Result<(), Error> {
+    // Push a message for the event to all clients registered on the channel
+    //
+    // The message is first serialized and then send to all registered
+    // clients on the given channel, if any.
+    //
+    // Returns an error if the serialization fails.
+    pub fn push<S: Serialize>(&self, channel: C, event: &str, message: &S) -> Result<(), Error> {
         let payload = serde_json::to_string(message)?;
         let message = format!("event: {}\ndata: {}\n\n", event, payload);
 
@@ -150,7 +158,7 @@ impl Server {
             .clone() // TODO: can this clone be avoided?
     }
 
-    fn add_client(&self, channel: u64, sender: hyper::body::Sender) {
+    fn add_client(&self, channel: C, sender: hyper::body::Sender) {
         self.channels
             .lock().unwrap()
             .entry(channel)
@@ -180,7 +188,7 @@ impl Server {
         });
     }
 
-    fn send_chunk_to_channel(&self, chunk: String, channel: u64) -> Result<(), Error> {
+    fn send_chunk_to_channel(&self, chunk: String, channel: C) -> Result<(), Error> {
         let mut channels = self.channels.lock().unwrap();
 
         match channels.get_mut(&channel) {
@@ -237,7 +245,7 @@ impl Client {
 }
 
 lazy_static! {
-    static ref PUSH_SERVER: Server = Server::new();
+    static ref PUSH_SERVER: Server<u64> = Server::new();
 }
 
 fn sse(req: Request<Body>) -> future::Ok<Response<Body>, hyper::Error> {
