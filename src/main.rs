@@ -65,10 +65,6 @@ impl<C: Hash + Eq + FromStr> Server<C> {
         Ok(())
     }
 
-    pub fn send_heartbeats(&self) {
-        self.send_chunk_to_all_clients(":\n\n".into());
-    }
-
     // Initiate a new sse stream for the given request.
     //
     // The request must include a valid authorization token cookie. The
@@ -158,16 +154,8 @@ impl<C: Hash + Eq + FromStr> Server<C> {
             .clone() // TODO: can this clone be avoided?
     }
 
-    fn add_client(&self, channel: C, sender: hyper::body::Sender) {
-        self.channels
-            .lock().unwrap()
-            .entry(channel)
-            .or_insert_with(Default::default)
-            .push(Client {
-                tx: sender,
-                id: self.next_id.fetch_add(1, Ordering::SeqCst),
-                first_error: None,
-            });
+    pub fn send_heartbeats(&self) {
+        self.send_chunk_to_all_clients(":\n\n".into());
     }
 
     pub fn remove_stale_clients(&self) {
@@ -186,6 +174,18 @@ impl<C: Hash + Eq + FromStr> Server<C> {
 
             !clients.is_empty()
         });
+    }
+
+    fn add_client(&self, channel: C, sender: hyper::body::Sender) {
+        self.channels
+            .lock().unwrap()
+            .entry(channel)
+            .or_insert_with(Default::default)
+            .push(Client {
+                tx: sender,
+                id: self.next_id.fetch_add(1, Ordering::SeqCst),
+                first_error: None,
+            });
     }
 
     fn send_chunk_to_channel(&self, chunk: String, channel: C) -> Result<(), Error> {
