@@ -34,14 +34,18 @@ const COOKIE_NAME: &'static str = "sse-authorization";
 type Clients = Vec<Client>;
 type Channels<C> = HashMap<C, Clients>;
 
-struct Server<C> {
+/// Push server implementing Server-Sent Events (SSE)
+///
+/// Because the Server implements `Sync`, it can be stored in
+/// a static variable using e.g. `lazy_static`.
+pub struct Server<C> {
     channels: Mutex<Channels<C>>,
     next_id: AtomicUsize,
     cookie_key: Key,
 }
 
 impl<C: Hash + Eq + FromStr> Server<C> {
-    // Create a new SSE push-server
+    /// Create a new SSE push-server.
     pub fn new() -> Server<C> {
         Server {
             channels: Mutex::new(HashMap::new()),
@@ -50,12 +54,12 @@ impl<C: Hash + Eq + FromStr> Server<C> {
         }
     }
 
-    // Push a message for the event to all clients registered on the channel
-    //
-    // The message is first serialized and then send to all registered
-    // clients on the given channel, if any.
-    //
-    // Returns an error if the serialization fails.
+    /// Push a message for the event to all clients registered on the channel.
+    ///
+    /// The message is first serialized and then send to all registered
+    /// clients on the given channel, if any.
+    ///
+    /// Returns an error if the serialization fails.
     pub fn push<S: Serialize>(&self, channel: C, event: &str, message: &S) -> Result<(), Error> {
         let payload = serde_json::to_string(message)?;
         let message = format!("event: {}\ndata: {}\n\n", event, payload);
@@ -65,12 +69,12 @@ impl<C: Hash + Eq + FromStr> Server<C> {
         Ok(())
     }
 
-    // Initiate a new sse stream for the given request.
-    //
-    // The request must include a valid authorization token cookie. The
-    // channel is parsed from the last segment of the uri path. If the
-    // request cannot be parsed correctly of the auth token is expired,
-    // an appropriate http error response is returned.
+    /// Initiate a new SSE stream for the given request.
+    ///
+    /// The request must include a valid authorization token cookie. The
+    /// channel is parsed from the last segment of the uri path. If the
+    /// request cannot be parsed correctly of the auth token is expired,
+    /// an appropriate http error response is returned.
     pub fn create_stream(&self, request: &Request<Body>) -> Response<Body> {
         // Extract channel from uri path (last segment)
         let path = request.uri().path();
@@ -130,12 +134,12 @@ impl<C: Hash + Eq + FromStr> Server<C> {
             .expect("Could not create response")
     }
 
-    // Create a cookie with an authorization token that will be checked
-    // in `register_client` before establishing the sse stream.
-    //
-    // A new token can be send to the client on every request, as
-    // creating and checking the tokens is cheap. The token is valid
-    // for 24 hours after it has been generated.
+    /// Create a cookie with an authorization token that will be checked
+    /// in `register_client` before establishing the SSE stream.
+    ///
+    /// A new token can be send to the client on every request, as
+    /// creating and checking the tokens is cheap. The token is valid
+    /// for 24 hours after it has been generated.
     pub fn generate_auth_cookie(&self) -> Cookie {
         let unix_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -154,10 +158,22 @@ impl<C: Hash + Eq + FromStr> Server<C> {
             .clone() // TODO: can this clone be avoided?
     }
 
+    /// Send hearbeat to all clients on all channels.
+    ///
+    /// This should be called regularly (e.g. every minute) to detect
+    /// a disconnect of the underlying TCP connection.
     pub fn send_heartbeats(&self) {
         self.send_chunk_to_all_clients(":\n\n".into());
     }
 
+    /// Remove disconnected clients.
+    ///
+    /// This removes all clients from all channels that have closed the
+    /// conenction or are not responding to the heartbeats, which caused
+    /// a TPC timeout.
+    ///
+    /// This function should be called regularly (e.g. together with
+    /// `send_heartbeats`) to keep the memory usage low.
     pub fn remove_stale_clients(&self) {
         let mut channels = self.channels.lock().unwrap();
 
