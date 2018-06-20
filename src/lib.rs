@@ -41,8 +41,7 @@ type Channels<C> = HashMap<C, Clients>;
 /// the different channels and can be chosen arbitrarily.
 ///
 /// Because the Server implements `Sync`, it can e.g. be stored
-/// in a static variable using `lazy_static` or in the rocket
-/// state system.
+/// in a static variable using `lazy_static`.
 pub struct Server<C> {
     channels: Mutex<Channels<C>>,
     next_id: AtomicUsize,
