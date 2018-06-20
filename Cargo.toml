@@ -2,6 +2,12 @@
 name = "hyper-sse"
 version = "0.1.0"
 authors = ["Klemens Schölhorn <klemens@schoelhorn.eu>"]
+description = "Server-Sent Events (SSE) library for hyper and Rocket"
+documentation = "https://docs.rs/hyper-sse"
+repository = "https://github.com/klemens/hyper-sse"
+readme = "README.md"
+categories = ["network-programming"]
+license = "Apache-2.0/MIT"
 
 [dependencies]
 # Use cookie 0.9 to be compatible with rocket
