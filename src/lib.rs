@@ -30,8 +30,19 @@ type Channels<C> = HashMap<C, Clients>;
 
 /// Push server implementing Server-Sent Events (SSE).
 ///
-/// Because the Server implements `Sync`, it can be stored in
-/// a static variable using e.g. `lazy_static`.
+/// SSE allow pushing events to browsers over HTTP without polling.
+/// This library uses async hyper to support many concurrent push
+/// connections and is compatible with the Rocket framework. It
+/// supports multiple parallel channels and client authentication.
+/// The authentication is currently global and allows access to all
+/// channels, however this may change in the future.
+///
+/// The generic parameter `C` specifies the type used to distinguish
+/// the different channels and can be chosen arbitrarily.
+///
+/// Because the Server implements `Sync`, it can e.g. be stored
+/// in a static variable using `lazy_static` or in the rocket
+/// state system.
 pub struct Server<C> {
     channels: Mutex<Channels<C>>,
     next_id: AtomicUsize,
