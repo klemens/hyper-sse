@@ -1,7 +1,6 @@
 #![feature(assoc_unix_epoch)]
 
 extern crate cookie;
-extern crate failure;
 extern crate futures;
 extern crate hyper;
 extern crate serde;
@@ -9,7 +8,6 @@ extern crate serde_json;
 extern crate tokio;
 
 use cookie::{Cookie, CookieJar, Key};
-use failure::Error;
 use futures::future;
 use hyper::header::COOKIE;
 use hyper::{Body, Chunk, Request, Response, StatusCode};
@@ -56,11 +54,11 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
     /// clients on the given channel, if any.
     ///
     /// Returns an error if the serialization fails.
-    pub fn push<S: Serialize>(&self, channel: C, event: &str, message: &S) -> Result<(), Error> {
+    pub fn push<S: Serialize>(&self, channel: C, event: &str, message: &S) -> Result<(), serde_json::error::Error> {
         let payload = serde_json::to_string(message)?;
         let message = format!("event: {}\ndata: {}\n\n", event, payload);
 
-        self.send_chunk_to_channel(message, channel)?;
+        self.send_chunk_to_channel(message, channel);
 
         Ok(())
     }
@@ -236,7 +234,7 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
             });
     }
 
-    fn send_chunk_to_channel(&self, chunk: String, channel: C) -> Result<(), Error> {
+    fn send_chunk_to_channel(&self, chunk: String, channel: C) {
         let mut channels = self.channels.lock().unwrap();
 
         match channels.get_mut(&channel) {
@@ -247,9 +245,7 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
                 }
             }
             None => {} // Currently no clients on the given channel
-        }
-
-        Ok(())
+        };
     }
 
     fn send_chunk_to_all_clients(&self, chunk: String) {
