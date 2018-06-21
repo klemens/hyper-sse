@@ -141,6 +141,7 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
         Response::builder()
             .header("Cache-Control", "no-cache")
             .header("Content-Type", "text/event-stream")
+            .header("Access-Control-Allow-Origin", "*")
             .body(body)
             .expect("Could not create response")
     }
