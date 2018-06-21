@@ -101,7 +101,7 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
             .map(|cookie| cookie.trim())
             .filter(|cookie| cookie.starts_with(COOKIE_NAME))
             .map(|cookies| cookies.to_string()) // Cookies requires 'static
-            .filter_map(|cookie| Cookie::parse(cookie).ok())
+            .filter_map(|cookie| Cookie::parse_encoded(cookie).ok())
             .fold(CookieJar::new(), |mut jar, cookie| {
                 jar.add_original(cookie);
                 jar

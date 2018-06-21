@@ -11,7 +11,7 @@ license = "Apache-2.0/MIT"
 
 [dependencies]
 # Use cookie 0.9 to be compatible with rocket
-cookie = { version = "0.9.1", features = ["secure"] }
+cookie = { version = "0.9.1", features = ["percent-encode", "secure"] }
 futures = "0.1"
 hyper = "0.12"
 serde = "1"
