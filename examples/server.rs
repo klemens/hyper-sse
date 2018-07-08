@@ -23,7 +23,7 @@ const HTML: &'static str = "\
 <body>
     <ol></ol>
     <script>
-        var evtSource = new EventSource('http://[::1]:3000/events/0');
+        var evtSource = new EventSource('http://[::1]:3000/push/0?%auth_token%');
         evtSource.addEventListener('update', event => {
             var newElement = document.createElement('li');
             var eventList = document.querySelector('ol');
@@ -37,11 +37,10 @@ const HTML: &'static str = "\
 fn service_handler(req: Request<Body>) -> Response<Body> {
     match req.uri().path() {
         "/" => {
-            let auth_cookie = PUSH_SERVER.generate_auth_cookie();
+            let auth_cookie = PUSH_SERVER.generate_auth_token(Some(0)).unwrap();
 
             Response::builder()
-                .header("Set-Cookie", auth_cookie.to_string().as_str())
-                .body(HTML.into())
+                .body(HTML.replace("%auth_token%", &auth_cookie).into())
                 .expect("Invalid header specification")
         },
         _ => {

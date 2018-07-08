@@ -1,16 +1,19 @@
-extern crate cookie;
+extern crate base64;
 extern crate futures;
 extern crate hyper;
+extern crate libhydrogen;
 extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio;
 
-use cookie::{Cookie, CookieJar, Key};
 use futures::future;
-use hyper::header::COOKIE;
 use hyper::{Body, Chunk, Request, Response, StatusCode};
 use hyper::rt::{Future, Stream};
+use libhydrogen::secretbox::Key;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::SocketAddr;
@@ -18,10 +21,10 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::timer::Interval;
 
-const COOKIE_NAME: &'static str = "sse-authorization";
+const HYDRO_CONTEXT: &'static str = "ssetoken";
 
 type Clients = Vec<Client>;
 type Channels<C> = HashMap<C, Clients>;
@@ -32,8 +35,6 @@ type Channels<C> = HashMap<C, Clients>;
 /// This library uses async hyper to support many concurrent push
 /// connections and is compatible with the Rocket framework. It
 /// supports multiple parallel channels and client authentication.
-/// The authentication is currently global and allows access to all
-/// channels, however this may change in the future.
 ///
 /// The generic parameter `C` specifies the type used to distinguish
 /// the different channels and can be chosen arbitrarily.
@@ -43,16 +44,25 @@ type Channels<C> = HashMap<C, Clients>;
 pub struct Server<C> {
     channels: Mutex<Channels<C>>,
     next_id: AtomicUsize,
-    cookie_key: Key,
+    token_key: Key,
 }
 
-impl<C: Hash + Eq + FromStr + Send> Server<C> {
+#[derive(Deserialize, Serialize)]
+struct AuthToken<C> {
+    created: SystemTime,
+    allowed_channel: Option<C>,
+}
+
+impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
     /// Create a new SSE push-server.
     pub fn new() -> Server<C> {
+        libhydrogen::init()
+            .expect("could not init libhydrogen");
+
         Server {
             channels: Mutex::new(HashMap::new()),
             next_id: AtomicUsize::new(0),
-            cookie_key: Key::generate(),
+            token_key: Key::gen(),
         }
     }
 
@@ -73,15 +83,33 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
 
     /// Initiate a new SSE stream for the given request.
     ///
-    /// The request must include a valid authorization token cookie. The
+    /// The request must include a valid authorization token. The
     /// channel is parsed from the last segment of the uri path. If the
     /// request cannot be parsed correctly or the auth token is expired,
     /// an appropriate http error response is returned.
     pub fn create_stream(&self, request: &Request<Body>) -> Response<Body> {
+        use base64::{decode_config, URL_SAFE_NO_PAD};
+        use libhydrogen::secretbox::decrypt;
+
         // Extract channel from uri path (last segment)
-        let path = request.uri().path();
-        let channel = match path.rsplit('/').next().map(FromStr::from_str) {
-            Some(Ok(channel)) => channel,
+        let channel = request.uri().path()
+            .rsplit('/').next()
+            .and_then(|channel_str| C::from_str(channel_str).ok());
+
+        // Extract auth token from query, decode, decrypt and deserialize
+        let token = request.uri().query()
+            .and_then(|query| decode_config(query, URL_SAFE_NO_PAD).ok())
+            .and_then(|opaque_token| decrypt(
+                &opaque_token, 0, &HYDRO_CONTEXT.into(),
+                &self.token_key).ok()
+            )
+            .and_then(|token_str|
+                serde_json::from_slice::<AuthToken<C>>(&token_str).ok()
+            );
+
+        // Check if the request contained a valid channel and token
+        let (channel, token) = match (channel, token) {
+            (Some(channel), Some(token)) => (channel, token),
             _ => {
                 return Response::builder()
                     .status(StatusCode::BAD_REQUEST)
@@ -90,37 +118,17 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
             }
         };
 
-        // Parse request cookies and load into a cookie jar, which is
-        // used for the decrytion of the cookie
-        let mut cookies = request.headers()
-            .get_all(COOKIE).iter()
-            .filter_map(|cookies| cookies.to_str().ok())
-            .flat_map(|cookies| cookies.split(';'))
-            .map(|cookie| cookie.trim())
-            .filter(|cookie| cookie.starts_with(COOKIE_NAME))
-            .map(|cookies| cookies.to_string()) // Cookies requires 'static
-            .filter_map(|cookie| Cookie::parse_encoded(cookie).ok())
-            .fold(CookieJar::new(), |mut jar, cookie| {
-                jar.add_original(cookie);
-                jar
-            });
-
-        // Decrypt auth token, parse the unix timestamp, and calculate
-        // the elapsed time since its creation
-        let token_time = cookies.private(&self.cookie_key)
-            .get(COOKIE_NAME)
-            .and_then(|cookie| cookie.value().parse().ok())
-            .map(|value| UNIX_EPOCH + Duration::from_secs(value))
-            .map(|token_time| SystemTime::now().duration_since(token_time));
-
-        // Check if client is authorized (has a valid auth token
-        // not older than 24 hours)
-        let authorized = match token_time {
-            Some(Ok(duration)) => duration.as_secs() < 24 * 60 * 60,
-            Some(Err(_)) => true, // Token is in the future (time shift)
-            None => false, // No auth cookie found
+        // Check that the auth token is not older than 24 hours and
+        // specifies the correct channel
+        let correct_channel = match token.allowed_channel {
+            Some(token_channel) => channel == token_channel,
+            None => true, // None means all channels are allowed
         };
-        if !authorized {
+        let fresh_token = match SystemTime::now().duration_since(token.created) {
+            Ok(duration) => duration.as_secs() < 24 * 60 * 60,
+            Err(_) => true, // Token is in the future (time shift)
+        };
+        if !correct_channel || !fresh_token {
             return Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .body(Body::empty())
@@ -137,28 +145,30 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
             .expect("Could not create response")
     }
 
-    /// Create a cookie with an authorization token that will be checked
-    /// in `register_client` before establishing the SSE stream.
+    /// Create an opaque authorization token that will be checked
+    /// in `create_stream` before establishing the SSE stream.
     ///
     /// A new token can be send to the client on every request, as
     /// creating and checking the tokens is cheap. The token is valid
-    /// for 24 hours after it has been generated.
-    pub fn generate_auth_cookie(&self) -> Cookie {
-        let unix_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before unix epoch");
-        let cookie_value = unix_time.as_secs().to_string();
+    /// for 24 hours after it has been generated and can only be used
+    /// on the specified channel if specified. The token must be passed
+    /// as the query url segment to the sse endpoint.
+    ///
+    /// Returns an error if the channel serialization fails.
+    pub fn generate_auth_token(&self, channel: Option<C>) -> Result<String, serde_json::error::Error> {
+        use base64::{encode_config, URL_SAFE_NO_PAD};
+        use libhydrogen::secretbox::encrypt;
 
-        // Create private (encrypted and authenticated) cookie
-        // with the current unix timestamp as its value using
-        // the CookieJar
-        let mut jar = CookieJar::new();
-        jar.private(&self.cookie_key)
-            .add(Cookie::new(COOKIE_NAME, cookie_value));
+        let token = AuthToken {
+            created: SystemTime::now(),
+            allowed_channel: channel,
+        };
+        let token = serde_json::to_vec(&token)?;
 
-        jar.get(COOKIE_NAME)
-            .expect("Cookie was just inserted")
-            .clone() // TODO: can this clone be avoided?
+        let ciphertext = encrypt(&token, 0, &HYDRO_CONTEXT.into(), &self.token_key);
+        let opaque_token = encode_config(&ciphertext, URL_SAFE_NO_PAD);
+
+        Ok(opaque_token)
     }
 
     /// Send hearbeat to all clients on all channels.
@@ -172,8 +182,8 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
     /// Remove disconnected clients.
     ///
     /// This removes all clients from all channels that have closed the
-    /// conenction or are not responding to the heartbeats, which caused
-    /// a TPC timeout.
+    /// connection or are not responding to the heartbeats, which caused
+    /// a TCP timeout.
     ///
     /// This function should be called regularly (e.g. together with
     /// `send_heartbeats`) to keep the memory usage low.

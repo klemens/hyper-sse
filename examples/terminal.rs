@@ -14,8 +14,10 @@ fn main() {
     let addr = ("[::1]:3000").parse().unwrap();
     PUSH_SERVER.spawn(addr);
 
+    let auth_token = PUSH_SERVER.generate_auth_token(Some(0)).unwrap()
+
     println!("Use the following command to connect to the SSE push server:");
-    println!("  curl -b {} http://[::1]:3000/channel/0", PUSH_SERVER.generate_auth_cookie());
+    println!("  curl http://[::1]:3000/push/0?{}", auth_token);
     println!("Enter push message and press enter:");
 
     let stdin = io::stdin();

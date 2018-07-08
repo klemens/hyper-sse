@@ -3,8 +3,7 @@
 [![crates.io version](https://img.shields.io/crates/v/hyper-sse.svg)](https://crates.io/crates/hyper-sse)
 [![docs.rs version](https://docs.rs/hyper-sse/badge.svg)](https://docs.rs/hyper-sse)
 
-Simple Server-Sent Events (SSE) library for hyper and Rocket. Requires
-a nightly compiler until Rust 1.28 is stable.
+Simple Server-Sent Events (SSE) library for hyper and Rocket using JSON for message encoding.
 
 ## Example
 
@@ -28,7 +27,7 @@ lazy_static! {
 fn main() {
     SSE.spawn("[::1]:3000".parse().unwrap());
 
-    // Use SSE.generate_auth_cookie() to generate auth tokens
+    // Use SSE.generate_auth_token(_) to generate auth tokens
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
