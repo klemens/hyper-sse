@@ -1,5 +1,3 @@
-#![feature(assoc_unix_epoch)]
-
 extern crate cookie;
 extern crate futures;
 extern crate hyper;
@@ -20,7 +18,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::timer::Interval;
 
 const COOKIE_NAME: &'static str = "sse-authorization";
@@ -112,7 +110,7 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
         let token_time = cookies.private(&self.cookie_key)
             .get(COOKIE_NAME)
             .and_then(|cookie| cookie.value().parse().ok())
-            .map(|value| SystemTime::UNIX_EPOCH + Duration::from_secs(value))
+            .map(|value| UNIX_EPOCH + Duration::from_secs(value))
             .map(|token_time| SystemTime::now().duration_since(token_time));
 
         // Check if client is authorized (has a valid auth token
@@ -147,7 +145,7 @@ impl<C: Hash + Eq + FromStr + Send> Server<C> {
     /// for 24 hours after it has been generated.
     pub fn generate_auth_cookie(&self) -> Cookie {
         let unix_time = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
             .expect("System time before unix epoch");
         let cookie_value = unix_time.as_secs().to_string();
 
