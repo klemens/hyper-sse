@@ -14,7 +14,7 @@ fn main() {
     let addr = ("[::1]:3000").parse().unwrap();
     PUSH_SERVER.spawn(addr);
 
-    let auth_token = PUSH_SERVER.generate_auth_token(Some(0)).unwrap()
+    let auth_token = PUSH_SERVER.generate_auth_token(Some(0)).unwrap();
 
     println!("Use the following command to connect to the SSE push server:");
     println!("  curl http://[::1]:3000/push/0?{}", auth_token);
